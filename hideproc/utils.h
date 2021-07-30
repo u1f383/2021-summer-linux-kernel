@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/livepatch.h>
+#include <linux/pid.h>
 
 struct ftrace_hook {
     const char *name;
