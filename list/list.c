@@ -154,6 +154,7 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
     for (size_t iret = 0; iret < rl->size; iret++) {
         uintptr_t obj = rl->list[iret];
         bool can_delete = true;
+        /* traverse all hp of all thread */
         for (int itid = 0; itid < HP_MAX_THREADS && can_delete; itid++) {
             for (int ihp = hp->max_hps - 1; ihp >= 0; ihp--) {
                 if (atomic_load(&hp->hp[itid][ihp]) == obj) {
@@ -163,6 +164,7 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
             }
         }
 
+        /* node not in hp */
         if (can_delete) {
             size_t bytes = (rl->size - iret) * sizeof(rl->list[0]);
             memmove(&rl->list[iret], &rl->list[iret + 1], bytes);
@@ -248,14 +250,9 @@ static bool __list_find(list_t *list,
     list_node_t *curr = NULL, *next = NULL;
 
 try_again:
-    /* get list head (? */
-    prev = &list->head;
-    /* Atomically obtains the value pointed to by obj */
+    prev = &list->head; /* get list head addr */
     curr = (list_node_t *) atomic_load(prev); /* curr <-- prev */
 
-    /* put curr into list->hp[ tid() ][ HP_CURR ] */
-    /* set hazard pointer CURR pointer is curr */
-    /* curr protect by hazard */
     (void) list_hp_protect_ptr(list->hp, HP_CURR, (uintptr_t) curr);
     /* if previous != unmarked curr value, then other thread updated curr value (?) */
     if (atomic_load(prev) != get_unmarked(curr))
@@ -319,57 +316,56 @@ bool list_insert(list_t *list, list_key_t key)
 
     while (true) {
         if (__list_find(list, &key, &prev, &curr, &next)) {
-            list_node_destroy(node); /* already has node */
-            list_hp_clear(list->hp); /* clear hazard array */
-            return false;
+            list_node_destroy(node);
+            list_hp_clear(list->hp);
+            return false; /* has found, not need to insert */
         }
         // node->next = curr
         atomic_store_explicit(&node->next, (uintptr_t) curr,
                               memory_order_relaxed);
         uintptr_t tmp = get_unmarked(curr);
+        
         /**
-         * atomic_compare_exchange_strong () -
-         * Compares the contents of the value contained in prev with the value pointed by tmp:
-         * @atomic<T>* obj
-         * @T* expected
-         * @T val
-         * @if true (*obj == *expected), it replaces the contained value with val
-         * @if false (*obj != *expected), it replaces the value pointed by expected with the contained value
-         * *obj = val ? *obj == *expected : *expected
+         * if (prev != curr)
+         *     prev = node
+         * else
+         *     prev = curr
          */
         if (atomic_compare_exchange_strong(prev, &tmp, (uintptr_t) node)) {
-            list_hp_clear(list->hp); /* clear hazard array */
+            list_hp_clear(list->hp); /* save successfully */
             return true;
         }
     }
 }
 
-bool list_delete(list_t *list, list_key_t key)
+bool list_delete(list_t *list, list_key_t key /* element address as key */)
 {
     list_node_t *curr, *next;
     atomic_uintptr_t *prev;
     while (true) {
         if (!__list_find(list, &key, &prev, &curr, &next)) {
-            list_hp_clear(list->hp); /* hazard pointer not need anymore */
+            list_hp_clear(list->hp); /* not found */
             return false;
         }
-
+        /* prev <--> curr <--> next */
         uintptr_t tmp = get_unmarked(next);
 
+        /* mark next */
         if (!atomic_compare_exchange_strong(&curr->next, &tmp,
                                             get_marked(next)))
             continue;
 
+        /* unmark curr */
         tmp = get_unmarked(curr);
-        /* hazard pointer not need anymore ? */
-        /* compare prev == &tmp == curr */
+        
+        /* if other thread has change  */
         if (atomic_compare_exchange_strong(prev, &tmp, get_unmarked(next))) {
-            list_hp_clear(list->hp);
+            list_hp_clear(list->hp); /* already finished */
             // DDD;
             atomic_store_explicit(&curr, get_marked(curr), memory_order_release); /* marked node released */
         } else {
-            /* already mark as released */
-            list_hp_clear(list->hp);
+            // if enters here, it means prev == get_unmarked(curr)
+            list_hp_clear(list->hp); /* already mark as released */
         }
         return true;
     }
@@ -429,17 +425,26 @@ static void *delete_thread(void *arg)
      */
     for (size_t i = 0; i < N_ELEMENTS; i++) /* 128 times */
         (void) list_delete(list, (uintptr_t) &elements[tid()][i]);
+        /**    1 2 3 4 ... 128
+         * 1
+         * 2
+         * 3
+         * ...
+         * N_THREADS
+         */
     return NULL;
 }
 
 int main(void)
 {
+    // 2 new nodes
     list_t *list = list_new(); /* init a list structure*/
 
     pthread_t thr[N_THREADS]; /* thread num */
 
     for (size_t i = 0; i < N_THREADS; i++)
-        /* half to delete and half to insert */
+        /* half do delete_thread and 
+         * half do insert_thread */
         pthread_create(&thr[i], NULL, (i & 1) ? delete_thread : insert_thread,
                        list);
 
